@@ -1,10 +1,8 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
-using System.Threading.Tasks;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
@@ -20,9 +18,9 @@ namespace LevelsRanksModuleFakeRank
     [MinimumApiVersion(80)]
     public class LevelsRanksModuleFakeRank : BasePlugin
     {
-        public override string ModuleName => "[LR] Module - FakeRank";
-        public override string ModuleVersion => "1.0.3";
-        public override string ModuleAuthor => "ABKAM designed by RoadSide Romeo & Wend4r";
+        public override string ModuleName => "[LR] Module - FakeRank by Dz!ad3k";
+        public override string ModuleVersion => "1.0.8";
+        public override string ModuleAuthor => "ABKAM designed by RoadSide Romeo & Wend4r, fixed by Dz!ad3k";
 
         private Dictionary<int, (int competitiveRanking, int competitiveRankType)>? _ranksConfig;
         private readonly Dictionary<string, (int competitiveRanking, int competitiveRankType)> _playerRanks = new();
@@ -30,129 +28,201 @@ namespace LevelsRanksModuleFakeRank
         private readonly PluginCapability<ILevelsRanksApi> _apiCapability = new("levels_ranks");
         private IPlayerRankApi? _playerRankApi;
         private readonly PluginCapability<IPlayerRankApi> _playerRankApiCapability = new("PLAYER_RANK_API");
-        private Dictionary<string, int> _lastKnownLevels = new();
-        private ConcurrentDictionary<string, (int competitiveRanking, int competitiveRankType)> _rankCache = new();
-        private ConcurrentDictionary<string, DateTime> _cacheTimestamps = new();
+        private readonly Dictionary<string, int> _lastKnownLevels = new();
 
-        private readonly ConcurrentDictionary<string, bool>
-            _isCustomRankActive = new();
+        // Players we already warned about (not present in LR OnlineUsers) - prevents log spam every second.
+        private readonly HashSet<string> _missingWarned = new();
 
         private const float UpdateInterval = 1.0f;
+
+        // Set when clients should be told to (re)display ranks on the scoreboard. Handled at most once per
+        // UpdateInterval - sending the reveal every tick (original behaviour) made the icons flicker.
+        private bool _revealPending;
 
         public override void Load(bool hotReload)
         {
             _playerRankApi = new PlayerRankApi(this);
             Capabilities.RegisterPluginCapability(_playerRankApiCapability, () => _playerRankApi);
+
+            RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
+            RegisterEventHandler<EventPlayerConnectFull>((_, _) =>
+            {
+                // Give LR Core a moment to load the player, then refresh the scoreboard for everyone.
+                AddTimer(3.0f, () => _revealPending = true);
+                return HookResult.Continue;
+            });
+            RegisterEventHandler<EventRoundStart>((_, _) =>
+            {
+                _revealPending = true;
+                return HookResult.Continue;
+            });
         }
 
         public override void OnAllPluginsLoaded(bool hotReload)
         {
             base.OnAllPluginsLoaded(hotReload);
 
-            _api = _apiCapability.Get();
+            try
+            {
+                _api = _apiCapability.Get();
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"Failed to get Levels Ranks API: {e.Message}");
+            }
+
             if (_api == null)
             {
-                Server.PrintToConsole("Levels Ranks API is currently unavailable.");
+                Logger.LogError("Levels Ranks API is currently unavailable. FakeRank module is disabled.");
                 return;
             }
 
             CreateRanksConfig();
             _ranksConfig = LoadRanksConfig();
 
-            RegisterListener<Listeners.OnTick>(OnTick);
-            AddTimer(UpdateInterval, async () => { await FetchPlayerRanks(); }, TimerFlags.REPEAT);
+            // The game resets the scoreboard rank fields on its own, so they must be re-applied every tick
+            // (only when they differ - cheap, no disk access). LR levels are fetched once per second.
+            RegisterListener<Listeners.OnTick>(ApplyRanks);
+            AddTimer(UpdateInterval, () =>
+            {
+                FetchPlayerRanks();
+                if (_revealPending)
+                {
+                    _revealPending = false;
+                    RevealRanksToAll();
+                }
+            }, TimerFlags.REPEAT);
         }
 
-        private async Task FetchPlayerRanks()
+        private static IEnumerable<CCSPlayerController> GetRealPlayers()
         {
-            var players = Utilities.GetPlayers()
-                .Where(player => !player.IsBot && player.TeamNum != (int)CsTeam.Spectator);
-            var steamIds = players.Select(player => _api!.ConvertToSteamId(player.SteamID)).ToList();
+            return Utilities.GetPlayers().Where(player =>
+                player is { IsValid: true, IsBot: false, IsHLTV: false } &&
+                player.Connected == 0 && // 0 = fully connected (enum member name differs between CSS versions)
+                player.SteamID != 0 &&
+                player.TeamNum != (int)CsTeam.Spectator);
+        }
 
-            var playersToFetch = steamIds.Where(steamId =>
-                    !_rankCache.TryGetValue(steamId, out var cachedRank) ||
-                    !_cacheTimestamps.TryGetValue(steamId, out var cacheTime) ||
-                    (DateTime.UtcNow - cacheTime).TotalSeconds >= UpdateInterval)
-                .ToList();
+        private void FetchPlayerRanks()
+        {
+            if (_api == null) return;
 
-            if (playersToFetch.Count == 0)
+            foreach (var player in GetRealPlayers())
             {
-                return;
-            }
+                var steamId = _api.ConvertToSteamId(player.SteamID);
 
-            foreach (var steamId in playersToFetch)
-            {
-                if (_api!.OnlineUsers.TryGetValue(steamId, out var onlineUser))
+                if (!_api.OnlineUsers.TryGetValue(steamId, out var onlineUser))
                 {
-                    var currentLevelId = onlineUser.Rank;
-
-                    if (!_isCustomRankActive.TryGetValue(steamId, out var isCustomActive) || !isCustomActive)
+                    // LR Core has not loaded this player (yet). Warn once instead of every second.
+                    if (_missingWarned.Add(steamId))
                     {
-                        if (!_lastKnownLevels.TryGetValue(steamId, out var lastLevel) || currentLevelId != lastLevel)
-                        {
-                            if (_ranksConfig != null && _ranksConfig.TryGetValue(currentLevelId, out var rankInfo))
-                            {
-                                _playerRanks[steamId] = rankInfo;
-                                _lastKnownLevels[steamId] = currentLevelId;
-                                _rankCache[steamId] = rankInfo;
-                                _cacheTimestamps[steamId] = DateTime.UtcNow;
-                            }
-                        }
+                        Logger.LogWarning(
+                            $"Player {player.PlayerName} ({steamId}) is not in LR OnlineUsers - rank will be applied once LR Core loads the player.");
                     }
+
+                    continue;
                 }
-                else
+
+                if (_missingWarned.Remove(steamId))
                 {
-                    Logger.LogWarning($"Player {steamId} is not online. Skipping rank update.");
+                    Logger.LogInformation($"Player {player.PlayerName} ({steamId}) loaded by LR Core, applying fake rank.");
+                }
+
+                var currentLevelId = onlineUser.Rank;
+
+                if (_lastKnownLevels.TryGetValue(steamId, out var lastLevel) && currentLevelId == lastLevel)
+                    continue;
+
+                if (_ranksConfig != null && _ranksConfig.TryGetValue(currentLevelId, out var rankInfo))
+                {
+                    _playerRanks[steamId] = rankInfo;
+                    _lastKnownLevels[steamId] = currentLevelId;
+                    _revealPending = true;
                 }
             }
         }
 
-        private void OnTick()
+        private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
         {
-            var players = Utilities.GetPlayers()
-                .Where(player => !player.IsBot && player.TeamNum != (int)CsTeam.Spectator);
+            var player = @event.Userid;
+            if (player == null || !player.IsValid || player.IsBot || player.SteamID == 0)
+                return HookResult.Continue;
 
-            var filter = new RecipientFilter();
-            
-            foreach (var player in players)
+            var steamId64 = player.SteamID;
+            PlayerRankApi.ForgetCached(steamId64);
+
+            if (_api != null)
+            {
+                var steamId = _api.ConvertToSteamId(steamId64);
+                _playerRanks.Remove(steamId);
+                _lastKnownLevels.Remove(steamId);
+                _missingWarned.Remove(steamId);
+            }
+
+            return HookResult.Continue;
+        }
+
+        // Scoreboard reveal: "FakeRanks - Reveal All" (Metamod) on TAB, plus RevealRanksToAll() on join,
+        // round start and level change. Never per tick - that made the rank icons flicker.
+        private void ApplyRanks()
+        {
+            if (_api == null) return;
+
+            foreach (var player in GetRealPlayers())
             {
                 var steamId64 = player.SteamID;
-                var steamId = _api!.ConvertToSteamId(steamId64);
 
-                var customRank = PlayerRankApi.LoadPlayerRankFromFile(steamId64);
+                int rank;
+                int rankType;
 
+                // Custom rank (set via PLAYER_RANK_API) - cached in memory, no disk access.
+                var customRank = PlayerRankApi.GetCustomRank(steamId64);
                 if (customRank != null)
                 {
-                    if (player.CompetitiveRankType != (sbyte)customRank.RankType ||
-                        player.CompetitiveRanking != customRank.Rank)
-                    {
-                        player.CompetitiveRankType = (sbyte)customRank.RankType;
-                        player.CompetitiveRanking = customRank.Rank;
-                        player.CompetitiveWins = 777;
-                        filter.Add(player);
-                    }
+                    rank = customRank.Rank;
+                    rankType = customRank.RankType;
+                }
+                else if (_playerRanks.TryGetValue(_api.ConvertToSteamId(steamId64), out var rankInfo))
+                {
+                    rank = rankInfo.competitiveRanking;
+                    rankType = rankInfo.competitiveRankType;
                 }
                 else
                 {
-                    if (_playerRanks.TryGetValue(steamId, out var rankInfo))
-                    {
-                        if (player.CompetitiveRankType != (sbyte)rankInfo.competitiveRankType ||
-                            player.CompetitiveRanking != rankInfo.competitiveRanking)
-                        {
-                            player.CompetitiveRankType = (sbyte)rankInfo.competitiveRankType;
-                            player.CompetitiveRanking = rankInfo.competitiveRanking;
-                            player.CompetitiveWins = 777;
-                            filter.Add(player);
-                        }
-                    }
+                    continue;
                 }
+
+                SetRank(player, rank, rankType);
+            }
+        }
+
+        private static void RevealRanksToAll()
+        {
+            var filter = new RecipientFilter();
+            foreach (var player in Utilities.GetPlayers())
+            {
+                if (player is { IsValid: true, IsBot: false, IsHLTV: false } && player.Connected == 0)
+                    filter.Add(player);
             }
 
             if (filter.Count > 0)
-            {
-                var msg = UserMessage.FromId(350);
-                msg.Send(filter);
-            }
+                UserMessage.FromId(350).Send(filter);
+        }
+
+        // Sets the scoreboard rank and marks the fields as changed so the engine networks them to all clients.
+        internal static void SetRank(CCSPlayerController player, int rank, int rankType)
+        {
+            if (player.CompetitiveRankType == (sbyte)rankType && player.CompetitiveRanking == rank &&
+                player.CompetitiveWins == 777)
+                return;
+
+            player.CompetitiveRankType = (sbyte)rankType;
+            player.CompetitiveRanking = rank;
+            player.CompetitiveWins = 777;
+
+            Utilities.SetStateChanged(player, "CCSPlayerController", "m_iCompetitiveRankType");
+            Utilities.SetStateChanged(player, "CCSPlayerController", "m_iCompetitiveRanking");
+            Utilities.SetStateChanged(player, "CCSPlayerController", "m_iCompetitiveWins");
         }
 
         private void CreateRanksConfig()

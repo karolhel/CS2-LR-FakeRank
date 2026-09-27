@@ -1,3 +1,27 @@
+# [LR] Module - FakeRank — fixed by Dz!ad3k
+
+Fork of [ABKAM2023/CS2-LR-FakeRank](https://github.com/ABKAM2023/CS2-LR-FakeRank) with fixes for the current CounterStrikeSharp (net10.0). It is tested on a live 5v5 server, [Trollownia.pl](https://trollownia.pl).
+
+**Download:** [Releases](../../releases) → `LR-FakeRank.zip`. Unpack it into `game/csgo/`. Requires [LevelsRanks Core (fixed)](https://github.com/karolhel/CS2-LevelsRanks-Core) and the Metamod plugin [FakeRanks - Reveal All](https://github.com/Cruze03/FakeRanks-RevealAll).
+
+### What is fixed
+- 🔁 **Rank icons no longer flicker or jump between players** with several players online. The reveal message (350) is no longer sent every tick, and `SetStateChanged` is called.
+- 👁️ Ranks are revealed for everyone after a player joins, on round start and when an LR level changes.
+- 🧹 The `Player ... is not online. Skipping rank update.` warning is logged once, not every second.
+- ⚡ No disk read on every server tick: custom ranks are cached in memory.
+- 🛠️ Builds against the current CounterStrikeSharp (net10.0), with fixed DLL paths in the csproj.
+
+### Co naprawiono (PL)
+- Rangi w TAB nie migają i nie przeskakują między graczami.
+- Rangi pokazują się wszystkim po wejściu gracza, na początku rundy i po zmianie poziomu.
+- Koniec ze spamem „is not online” w konsoli.
+- Plugin nie czyta już pliku z dysku w każdym ticku.
+- Zbudowany pod aktualny CounterStrikeSharp (.NET 10).
+
+Original author: **ABKAM** (designed by RoadSide Romeo & Wend4r). Original README below.
+
+---
+
 ![GitHub Repo stars](https://img.shields.io/github/stars/ABKAM2023/CS2-LR-FakeRank?style=for-the-badge)
 ![GitHub all releases](https://img.shields.io/github/downloads/ABKAM2023/CS2-LR-FakeRank/total?style=for-the-badge)
 

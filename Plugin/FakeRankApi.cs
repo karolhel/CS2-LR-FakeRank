@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
@@ -6,8 +8,12 @@ using Microsoft.Extensions.Logging;
 
 public class PlayerRankApi : IPlayerRankApi
 {
-    private static LevelsRanksModuleFakeRank.LevelsRanksModuleFakeRank _core;
+    private static LevelsRanksModuleFakeRank.LevelsRanksModuleFakeRank _core = null!;
     private readonly Dictionary<ulong, (int originalRank, int originalRankType)> _originalRanks = new();
+
+    // In-memory cache of custom ranks (null = player has no custom rank file).
+    // Previously the file was read from disk for every player on every server tick.
+    private static readonly ConcurrentDictionary<ulong, PlayerRankData?> CustomRankCache = new();
 
     public PlayerRankApi(LevelsRanksModuleFakeRank.LevelsRanksModuleFakeRank core)
     {
@@ -22,8 +28,7 @@ public class PlayerRankApi : IPlayerRankApi
             _originalRanks[steamId] = (player.CompetitiveRanking, player.CompetitiveRankType);
         }
 
-        player.CompetitiveRanking = 0;
-        player.CompetitiveRankType = 0;
+        LevelsRanksModuleFakeRank.LevelsRanksModuleFakeRank.SetRank(player, 0, 0);
     }
 
     public void SetCustomRank(CCSPlayerController player, int rank, int rankType)
@@ -34,10 +39,11 @@ public class PlayerRankApi : IPlayerRankApi
             _originalRanks[steamId] = (player.CompetitiveRanking, player.CompetitiveRankType);
         }
 
-        player.CompetitiveRanking = rank;
-        player.CompetitiveRankType = (sbyte)rankType;
+        LevelsRanksModuleFakeRank.LevelsRanksModuleFakeRank.SetRank(player, rank, rankType);
 
-        SavePlayerRankToFile(steamId, rank, rankType); 
+        var rankData = new PlayerRankData { Rank = rank, RankType = rankType };
+        CustomRankCache[steamId] = rankData;
+        SavePlayerRankToFile(steamId, rankData);
     }
 
     public void ResetRank(CCSPlayerController player)
@@ -45,51 +51,75 @@ public class PlayerRankApi : IPlayerRankApi
         var steamId = player.SteamID;
         if (_originalRanks.TryGetValue(steamId, out var originalRank))
         {
-            player.CompetitiveRanking = originalRank.originalRank;
-            player.CompetitiveRankType = (sbyte)originalRank.originalRankType;
+            LevelsRanksModuleFakeRank.LevelsRanksModuleFakeRank.SetRank(player, originalRank.originalRank,
+                originalRank.originalRankType);
 
-            _originalRanks.Remove(steamId); 
-            DeletePlayerRankFile(steamId); 
+            _originalRanks.Remove(steamId);
         }
+
+        CustomRankCache[steamId] = null;
+        DeletePlayerRankFile(steamId);
     }
 
-    private void SavePlayerRankToFile(ulong steamId, int rank, int rankType)
+    public static PlayerRankData? GetCustomRank(ulong steamId)
     {
-        var filePath = GetPlayerRankFilePath(steamId);
-        var rankData = new PlayerRankData { Rank = rank, RankType = rankType };
-        var json = JsonSerializer.Serialize(rankData);
-        File.WriteAllText(filePath, json);
+        return CustomRankCache.GetOrAdd(steamId, LoadPlayerRankFromFile);
+    }
+
+    public static void ForgetCached(ulong steamId)
+    {
+        CustomRankCache.TryRemove(steamId, out _);
+    }
+
+    private static void SavePlayerRankToFile(ulong steamId, PlayerRankData rankData)
+    {
+        try
+        {
+            File.WriteAllText(GetPlayerRankFilePath(steamId), JsonSerializer.Serialize(rankData));
+        }
+        catch (Exception e)
+        {
+            _core.Logger.LogError($"Failed to save custom rank for {steamId}: {e.Message}");
+        }
     }
 
     public static PlayerRankData? LoadPlayerRankFromFile(ulong steamId)
     {
-        var filePath = GetPlayerRankFilePath(steamId);
-        if (File.Exists(filePath))
+        try
         {
-            var json = File.ReadAllText(filePath);
-            var rankData = JsonSerializer.Deserialize<PlayerRankData>(json);
-            return rankData;
-        }
+            var filePath = GetPlayerRankFilePath(steamId);
+            if (!File.Exists(filePath))
+                return null;
 
-        return null;
+            return JsonSerializer.Deserialize<PlayerRankData>(File.ReadAllText(filePath));
+        }
+        catch (Exception e)
+        {
+            _core.Logger.LogError($"Failed to load custom rank for {steamId}: {e.Message}");
+            return null;
+        }
     }
 
-    private void DeletePlayerRankFile(ulong steamId)
+    private static void DeletePlayerRankFile(ulong steamId)
     {
-        var filePath = GetPlayerRankFilePath(steamId);
-        if (File.Exists(filePath))
+        try
         {
-            File.Delete(filePath);
+            var filePath = GetPlayerRankFilePath(steamId);
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+        catch (Exception e)
+        {
+            _core.Logger.LogError($"Failed to delete custom rank for {steamId}: {e.Message}");
         }
     }
 
     private static string GetPlayerRankFilePath(ulong steamId)
     {
         var dataDirectory = Path.Combine(_core.ModuleDirectory, "PlayerData");
-        if (!Directory.Exists(dataDirectory))
-        {
-            Directory.CreateDirectory(dataDirectory);
-        }
+        Directory.CreateDirectory(dataDirectory);
 
         return Path.Combine(dataDirectory, $"{steamId}_rank.json");
     }
